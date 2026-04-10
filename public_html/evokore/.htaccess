@@ -1,0 +1,73 @@
+﻿# =========================
+# EvoKore - Security & Routing
+# =========================
+
+# Nunca listar diretórios
+Options -Indexes
+
+# Evita content negotiation indevida
+Options -MultiViews
+
+# Não expor assinatura do Apache em erros
+ServerSignature Off
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Preserva Authorization para PHP em ambientes CGI/FastCGI
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Bloqueia métodos HTTP não esperados
+    RewriteCond %{REQUEST_METHOD} !^(GET|POST|HEAD|OPTIONS)$ [NC]
+    RewriteRule ^ - [F,L]
+
+    # Bloqueia tentativa de path traversal
+    RewriteCond %{THE_REQUEST} "\.\./" [NC,OR]
+    RewriteCond %{REQUEST_URI} "\.\./" [NC]
+    RewriteRule ^ - [F,L]
+
+    # Bloqueia acesso a arquivos sensíveis e de ambiente/versionamento
+    RewriteRule (^|/)(\.env|\.git|\.svn|\.hg|composer\.(json|lock)|package(-lock)?\.json|yarn\.lock|phpunit\.xml(\.dist)?|Dockerfile|docker-compose\.ya?ml|\.htaccess|\.htpasswd)$ - [F,L,NC]
+
+    # Bloqueia extensões sensíveis que nunca devem ser públicas
+    RewriteRule \.(?:bak|conf|config|dist|fla|inc|ini|log|md|psd|sh|sql|swp|tmp|yml|yaml)$ - [F,L,NC]
+
+    # Bloqueia nomes comuns de webshell/script malicioso
+    RewriteRule (^|/)(cmd|shell|wso|c99|r57|backdoor)\.php$ - [F,L,NC]
+
+    # Bloqueia execução direta de scripts, exceto index.php e test-evo.php (temporário de homologação)
+    RewriteCond %{REQUEST_URI} !^/(index|test-evo)\.php$ [NC]
+    RewriteRule \.(?:phar|phtml|php\d*|cgi|pl|py|asp|aspx|jsp)$ - [F,L,NC]
+
+    # Se o arquivo/pasta existir fisicamente, serve normalmente
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Roteia todo o restante para o front controller
+    RewriteRule ^ index.php [L,QSA]
+</IfModule>
+
+<IfModule mod_headers.c>
+    # Segurança de MIME
+    Header always set X-Content-Type-Options "nosniff"
+
+    # Anti-clickjacking
+    Header always set X-Frame-Options "DENY"
+
+    # Proteção XSS para navegadores legados
+    Header always set X-XSS-Protection "1; mode=block"
+
+    # Política de referência
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+
+    # Política de permissões do navegador
+    Header always set Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+
+    # CSP enxuta para endpoint/API
+    Header always set Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+
+    # HSTS (ambiente HTTPS)
+    Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+</IfModule>
