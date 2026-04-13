@@ -40,6 +40,12 @@ return static function (array $app): void {
         return;
     }
 
+    if (str_starts_with($path, '/admin/')) {
+        $controller = new EvoKore\Controllers\AdminManagementController($app);
+        $controller->handle($method, $path);
+        return;
+    }
+
     if ($path === '/webhook/evo') {
         http_response_code(405);
         header('Allow: POST');
@@ -58,6 +64,12 @@ return static function (array $app): void {
         http_response_code(405);
         header('Allow: GET, POST');
         echo json_encode(['error' => 'Method Not Allowed'], JSON_UNESCAPED_UNICODE);
+        return;
+    }
+
+    if (str_starts_with($path, '/admin/')) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Not Found'], JSON_UNESCAPED_UNICODE);
         return;
     }
 
