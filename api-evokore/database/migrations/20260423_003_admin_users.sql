@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS admin_users (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  username VARCHAR(80) NOT NULL,
+  display_name VARCHAR(120) NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  role VARCHAR(40) NOT NULL DEFAULT 'admin',
+  status ENUM('ACTIVE', 'INACTIVE') NOT NULL DEFAULT 'ACTIVE',
+  last_login_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_admin_users_username (username),
+  KEY idx_admin_users_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+

@@ -36,9 +36,9 @@ ServerSignature Off
     # Bloqueia nomes comuns de webshell/script malicioso
     RewriteRule (^|/)(cmd|shell|wso|c99|r57|backdoor)\.php$ - [F,L,NC]
 
-    # Bloqueia execução direta de scripts, exceto index.php e test-evo.php (temporário de homologação)
-    RewriteCond %{REQUEST_URI} !^/(index|test-evo)\.php$ [NC]
-    RewriteRule \.(?:phar|phtml|php\d*|cgi|pl|py|asp|aspx|jsp)$ - [F,L,NC]
+    # Bloqueia execução direta de scripts sensíveis, mas permite index.php/test-evo.php.
+    # Usa o URI reescrito no contexto atual para não barrar o front controller.
+    RewriteRule ^(?!index\.php$|test-evo\.php$).+\.(?:phar|phtml|php\d*|cgi|pl|py|asp|aspx|jsp)$ - [F,L,NC]
 
     # Se o arquivo/pasta existir fisicamente, serve normalmente
     RewriteCond %{REQUEST_FILENAME} -f [OR]

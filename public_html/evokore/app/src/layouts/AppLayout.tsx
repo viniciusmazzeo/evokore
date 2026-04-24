@@ -1,11 +1,53 @@
 import type { PropsWithChildren } from 'react'
 import { AppHeader } from '@/components/AppHeader'
 
-export function AppLayout({ children }: PropsWithChildren) {
+type AppLayoutProps = PropsWithChildren<{
+  currentPage:
+    | 'dashboard'
+    | 'dashboard-plan-sales'
+    | 'dashboard-trial-classes'
+    | 'dashboard-logs'
+    | 'test-plan-sales'
+    | 'test-trial-classes'
+    | 'test-evo'
+    | 'cadastro'
+  onChangePage: (
+    page:
+      | 'dashboard'
+      | 'dashboard-plan-sales'
+      | 'dashboard-trial-classes'
+      | 'dashboard-logs'
+      | 'test-plan-sales'
+      | 'test-trial-classes'
+      | 'test-evo'
+      | 'cadastro',
+  ) => void
+  theme: 'light' | 'dark'
+  onToggleTheme: () => void
+  username?: string
+  onLogout: () => void
+}>
+
+export function AppLayout({
+  children,
+  currentPage,
+  onChangePage,
+  theme,
+  onToggleTheme,
+  username,
+  onLogout,
+}: AppLayoutProps) {
   return (
     <div className="min-h-screen bg-muted/40">
-      <AppHeader />
-      <main className="mx-auto w-full max-w-5xl px-4 py-10">{children}</main>
+      <AppHeader
+        currentPage={currentPage}
+        onChangePage={onChangePage}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
+        username={username}
+        onLogout={onLogout}
+      />
+      <main className="mx-auto w-full max-w-[1400px] px-4 py-8">{children}</main>
     </div>
   )
 }

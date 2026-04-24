@@ -53,6 +53,22 @@ try {
     define('EVOKORE_INTERNAL_BOOT', true);
 
     $app = safeRequire($privateApiDir, 'bootstrap.php');
+    $sessionName = trim((string) ($app['env']['ADMIN_SESSION_NAME'] ?? 'EVOKORESESSID'));
+    if ($sessionName === '') {
+        $sessionName = 'EVOKORESESSID';
+    }
+    session_name($sessionName);
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_start();
+    }
+
     $router = safeRequire($privateApiDir, 'router.php');
 
     if (!is_callable($router)) {

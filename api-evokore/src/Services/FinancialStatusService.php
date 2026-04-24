@@ -76,6 +76,7 @@ final class FinancialStatusService
                 'cpf' => $cleanCpf,
                 'error' => $e->getMessage(),
             ]);
+            $safe['__integration_error'] = $e->getMessage();
             return $safe;
         }
     }
@@ -97,7 +98,9 @@ final class FinancialStatusService
                 'memberId' => $cleanMemberId,
                 'error' => $e->getMessage(),
             ]);
-            return $this->emptyFinancialResult($cleanCpf, $cleanMemberId, $memberName);
+            $safe = $this->emptyFinancialResult($cleanCpf, $cleanMemberId, $memberName);
+            $safe['__integration_error'] = $e->getMessage();
+            return $safe;
         }
     }
 
