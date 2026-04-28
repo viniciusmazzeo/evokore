@@ -79,6 +79,8 @@ Exemplo `POST /admin/clients`:
 - `POST /admin/units/{id}/access-token` (gera/rotaciona token da unidade para n8n)
 - `GET /admin/units/{id}/evo-plans` (lista planos e precos da EVO para a unidade)
 - `GET /admin/units/{id}/evo-plans/active` (lista somente planos comerciais ativos da unidade)
+- `GET /admin/units/{id}/evo-plans/characteristics` (atalho para planos ativos + online com caracteristicas)
+- `GET /admin/units/{id}/evo-unit-info` (horarios, infraestrutura, tipos de aulas e professores da unidade)
 
 Exemplo `POST /admin/units`:
 
@@ -132,6 +134,9 @@ ame`
 Configuracao `.env`:
 
 - `EVO_PLANS_ENDPOINTS` define a ordem de tentativa dos endpoints EVO.
+- Para aumentar limite de requisicoes da EVO (sem bloqueio de 40/min), configure:
+  - `EVO_PRO_REQUEST_HEADER_NAME=evoapipro-request`
+  - `EVO_PRO_REQUEST_HEADER_VALUE=<valor fornecido pela EVO>`
 - Ordem recomendada (atual):
   - `/api/v2/membership` (oficial)
   - `/api/v1/sales/plans`
@@ -142,6 +147,128 @@ Configuracao `.env`:
 
 Observacao:
 - Para categorias de planos na EVO, pode ser usado `GET /api/v1/membership/category` (quando necessario em tela/filtros futuros).
+
+### Informacoes operacionais da unidade (horarios/infra/aulas/professores)
+
+Endpoint:
+
+```txt
+GET /admin/units/{id}/evo-unit-info
+```
+
+Query params opcionais:
+
+- `id_branch` (default: `EVO_DEFAULT_BRANCH_ID`)
+- `date_from` (`YYYY-MM-DD`, opcional)
+- `date_to` (`YYYY-MM-DD`, opcional)
+
+Sem `date_from/date_to`, o endpoint tenta trazer a grade completa sem filtro de data. Se a EVO nao retornar nesse modo, aplica fallback automatico para uma janela padrao configuravel (`EVO_UNIT_INFO_DEFAULT_WINDOW_DAYS`, default `30`).
+
+Exemplo:
+
+```txt
+GET /admin/units/3/evo-unit-info?id_branch=1&date_from=2026-04-24&date_to=2026-04-30
+```
+
+Exemplo sem filtro de datas:
+
+```txt
+GET /admin/units/3/evo-unit-info?id_branch=1
+```
+
+Retorno `200`:
+
+```json
+{
+  "data": {
+    "unit_id": 3,
+    "unit_name": "Vila Antonieta",
+    "unit_code": "PAN-AME-001",
+    "id_branch": 1,
+    "academy": {
+      "client_id": 1,
+      "client_name": "Panobianco",
+      "client_legal_name": "Panobianco Franchising LTDA",
+      "unit_id": 3,
+      "unit_name": "Vila Antonieta",
+      "unit_code": "PAN-AME-001",
+      "id_branch": 1
+    },
+    "period": {
+      "date_from": "2026-04-24",
+      "date_to": "2026-04-30"
+    },
+    "address": {
+      "street": "AV. INCONFIDENCIA MINEIRA",
+      "number": "1885",
+      "complement": null,
+      "district": "Vila Antonieta",
+      "city": "Sao Paulo",
+      "state": "SP",
+      "zip_code": "00000-000",
+      "formatted": "AV. INCONFIDENCIA MINEIRA, 1885 - Vila Antonieta - Sao Paulo/SP"
+    },
+    "contacts": {
+      "phone": "(11) 91659-0438",
+      "whatsapp": "(11) 91659-0438",
+      "email": "contato@academia.com.br"
+    },
+    "infrastructure": [
+      "Musculacao",
+      "Area de cardio",
+      "Aulas coletivas",
+      "Panobianco app"
+    ],
+    "has_parking": true,
+    "class_types": [
+      "Musculacao",
+      "Funcional"
+    ],
+    "teachers": [
+      "Professor A",
+      "Professor B"
+    ],
+    "schedule": [
+      {
+        "date": "2026-04-24",
+        "weekday": "sexta",
+        "first_time": "06:00",
+        "last_time": "21:00",
+        "time_slots": ["06:00", "07:00", "08:00"]
+      }
+    ],
+    "operation_today": {
+      "date": "2026-04-24",
+      "weekday": "sexta",
+      "open_at": "06:00",
+      "close_at": "21:00"
+    },
+    "metadata_source": "evo+config",
+    "metadata_endpoint": "/api/v1/branches",
+    "metadata_query": {
+      "idBranch": "1"
+    },
+    "source": "evo"
+  }
+}
+```
+
+Fallback:
+
+- Se a EVO estiver indisponivel, retorna `200` com:
+  - `source: "fallback"`
+  - `class_types`, `teachers` e `schedule` vazios
+  - `infrastructure` preenchida por configuracao/fallback
+  - `warning` e `details` com diagnostico.
+
+Configuracao opcional de infraestrutura via `.env`:
+
+- `UNIT_INFRASTRUCTURE_DEFAULT=Musculacao,Area de cardio,Aulas coletivas,Panobianco app`
+- `UNIT_INFRASTRUCTURE_MAP_JSON={"by_unit_code":{"PAN-AME-001":["Musculacao","Area de cardio"]},"by_unit_id":{"3":["Musculacao","Aulas coletivas"]},"default":["Musculacao","Area de cardio"]}`
+- `EVO_UNIT_INFO_DEFAULT_WINDOW_DAYS=30`
+- `EVO_UNIT_INFO_ENDPOINTS=/api/v1/branches,/api/v1/branch,/api/v1/units,/api/v1/unit,/api/v1/gyms,/api/v1/gym,/api/v1/companies,/api/v1/company`
+- `UNIT_ADDRESS_MAP_JSON={"by_unit_code":{"PAN-AME-001":{"street":"AV. INCONFIDENCIA MINEIRA","number":"1885","district":"Vila Antonieta","city":"Sao Paulo","state":"SP","zip_code":"00000-000","formatted":"AV. INCONFIDENCIA MINEIRA, 1885 - Vila Antonieta - Sao Paulo/SP"}}}`
+- `UNIT_CONTACTS_MAP_JSON={"by_unit_code":{"PAN-AME-001":{"phone":"(11) 91659-0438","whatsapp":"(11) 91659-0438","email":"contato@academia.com.br"}}}`
 
 ## Unit Credentials
 
@@ -164,7 +291,7 @@ Exemplo `POST /admin/unit-credentials`:
 Observacoes:
 
 - Quando uma credencial ativa (`is_active=1`) e criada/atualizada para a unidade, as anteriores da mesma unidade sao desativadas.
-- O retorno nao expÃƒÂµe token completo, apenas `token_hint`.
+- O retorno nao expõem token completo, apenas `token_hint`.
 
 ## Integration Logs
 
@@ -214,7 +341,7 @@ Retorna:
 
 Objetivo:
 - Permitir testes na tela de vendas usando apenas `unit_id` (cliente/unidade selecionados), sem precisar preencher `x-api-key` da unidade manualmente no front.
-- O backend resolve credencial EVO da unidade no banco e executa a integraÃƒÂ§ÃƒÂ£o.
+- O backend resolve credencial EVO da unidade no banco e executa a integração.
 
 ## Retorno simplificado de venda (n8n e teste admin)
 
@@ -243,7 +370,7 @@ Contrato de resposta `201`:
 ```
 
 Notas:
-- O backend nao expÃµe o `evo_response` completo no retorno padrao.
+- O backend nao expõem o `evo_response` completo no retorno padrao.
 - A resposta completa da EVO fica persistida em `plan_sales.evo_response_json` e no log `logs/evo-sales.log`.
 
 ### Cache de planos EVO
@@ -340,8 +467,18 @@ Observacoes:
 
 - Para `/api/v2/membership`, o backend consulta com `idBranch`, `showAccessBranches=false` e `showOnlineSalesObservation=false`.
 - O payload normalizado de planos inclui:
+  - `academy` (dados da academia/unidade para consumo do n8n/blip)
   - `id`, `name`, `value`
   - `regular_value`, `promotional_value`
+  - `is_promotional`
+  - `value_label`, `regular_value_label`, `promotional_value_label`
+  - `promo_message`
+  - `promo` (objeto com `is_promo`, `first_period_value`, `regular_value_after_period`, `period_label`, `message`)
+  - `months_promotional_period`, `days_promotional_period`
+  - `online_sales_observations`
+  - `differentials`
+  - `benefits`
+  - `url_sale`, `external_sale_available`
   - `is_active`, `is_online`, `status`
 
 ### Venda de plano (sem hardcode)
@@ -364,3 +501,50 @@ EVO_SALE_SHOW_CONTRACT_HTML=false
 EVO_SALE_PAYMENT_DEFAULT=6
 EVO_SALE_PAYMENT_FALLBACKS=2,3,4,5,1
 ```
+
+## Atualizacao 2026-04-23 - Webhook EVO e conciliacao automatica
+
+Endpoint:
+
+- `POST /webhook/evo`
+
+Autenticacao:
+
+- Header obrigatorio: `x-webhook-token: <WEBHOOK_TOKEN>`
+
+Comportamento:
+
+- valida token, content-type, tamanho de payload e rate limit
+- reconcilia pagamento da venda em `plan_sales` por prioridade:
+  1. `evo_sale_id`
+  2. `payment_reference`
+  3. `evo_member_id`
+  4. `cpf + plan_name` (fallback)
+- atualiza automaticamente:
+  - `status`
+  - `paid_value`
+  - `paid_at`
+  - `status_note`
+  - `last_webhook_at`
+  - `last_webhook_payload_json`
+
+Observacao:
+
+- `POST /n8n/sales/plan/status` continua ativo como fallback manual.
+
+## Atualizacao 2026-04-23 - Planos online ativos (filtro estrito)
+
+Endpoint:
+
+- `GET /admin/units/{id}/evo-plans/active?online_only=1`
+
+Regra de filtro online:
+
+- prioridade para `is_online = true` vindo da EVO
+- fallback por nome contendo:
+  - `ONLINE`
+  - `ON-LINE`
+  - `ON LINE`
+  - `VENDA ONLINE`
+
+Isso evita retorno de planos presenciais quando a EVO nao envia flag online de forma consistente.

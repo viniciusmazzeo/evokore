@@ -1,5 +1,11 @@
 # Etapa 13 - Fluxos de Venda de Plano e Aula Experimental
 
+> Nota de governanca:
+> Este documento preserva historico de evolucao da etapa 13.
+> Para contratos de API vigentes e comportamento atual, considerar como fonte primaria:
+> - `api-evokore/docs/admin-crud.md`
+> - `doc/18-estado-atual-consolidado.md`
+
 ## Objetivo
 Implementar dois fluxos separados da ponte n8n/EVO:
 

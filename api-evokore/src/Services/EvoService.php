@@ -14,6 +14,8 @@ final class EvoService
     private string $apiKey;
     private string $authMode;
     private string $dnsHeaderName;
+    private string $proRequestHeaderName;
+    private string $proRequestHeaderValue;
     private int $timeoutSeconds;
     private int $maxRetries;
     private string $logFile;
@@ -29,6 +31,8 @@ final class EvoService
         $this->apiKey = (string) ($config['api_key'] ?? $this->env('EVO_APIKEY', ''));
         $this->authMode = strtolower((string) ($config['auth_mode'] ?? $this->env('EVO_AUTH_MODE', 'bearer')));
         $this->dnsHeaderName = (string) ($config['dns_header_name'] ?? $this->env('EVO_DNS_HEADER_NAME', 'DNS'));
+        $this->proRequestHeaderName = $this->normalizeHeaderName((string) ($config['pro_request_header_name'] ?? $this->env('EVO_PRO_REQUEST_HEADER_NAME', 'evoapipro-request')));
+        $this->proRequestHeaderValue = trim((string) ($config['pro_request_header_value'] ?? $this->env('EVO_PRO_REQUEST_HEADER_VALUE', '')));
         $this->timeoutSeconds = (int) ($config['timeout_seconds'] ?? $this->envInt('EVO_TIMEOUT_SECONDS', 10));
         $this->maxRetries = (int) ($config['max_retries'] ?? $this->envInt('EVO_MAX_RETRIES', 2));
         $this->logFile = (string) ($config['log_file'] ?? dirname(__DIR__, 2) . '/logs/evo.log');
@@ -309,6 +313,487 @@ final class EvoService
         sort($slots, SORT_STRING);
 
         return array_values(array_unique($slots));
+    }
+
+    /**
+     * @return array<string,mixed>
+     */
+    public function getUnitOperationalInfo(?int $idBranch = null, ?string $dateFrom = null, ?string $dateTo = null): array
+    {
+        // Modo "sem filtro de datas": tenta buscar grade geral sem parametro de data
+        // e combina com janela curta para aumentar cobertura sem depender de um unico formato.
+        $rows = [];
+        if ($dateFrom === null && $dateTo === null) {
+            $allRows = $this->fetchScheduleRowsWithoutDate($idBranch);
+            foreach ($allRows as $row) {
+                $rows[] = $row;
+            }
+        }
+
+        $defaultWindowDays = max(1, (int) $this->envInt('EVO_UNIT_INFO_DEFAULT_WINDOW_DAYS', 6));
+        $from = $this->sanitizeDate($dateFrom ?? date('Y-m-d'), 'date_from');
+        $to = $this->sanitizeDate($dateTo ?? date('Y-m-d', strtotime($from . ' +' . $defaultWindowDays . ' days')), 'date_to');
+
+        $fromTs = strtotime($from);
+        $toTs = strtotime($to);
+        if ($fromTs === false || $toTs === false) {
+            throw new RuntimeException('Periodo invalido para consulta operacional da unidade.');
+        }
+        if ($toTs < $fromTs) {
+            throw new RuntimeException('date_to deve ser maior ou igual a date_from.');
+        }
+
+        // Limita janela para evitar carga excessiva na EVO.
+        $maxDays = max(1, (int) $this->envInt('EVO_UNIT_INFO_MAX_WINDOW_DAYS', 7));
+        if ((int) floor(($toTs - $fromTs) / 86400) > $maxDays) {
+            $toTs = strtotime($from . ' +' . $maxDays . ' days');
+            if ($toTs === false) {
+                throw new RuntimeException('Nao foi possivel limitar o periodo de consulta.');
+            }
+            $to = date('Y-m-d', $toTs);
+        }
+
+        for ($cursor = $fromTs; $cursor <= $toTs; $cursor += 86400) {
+            $targetDate = date('Y-m-d', $cursor);
+            $query = [
+                'onlyAvailables' => strtolower(trim($this->env('EVO_UNIT_INFO_ONLY_AVAILABLES', 'false'))) === 'true' ? 'true' : 'false',
+                'date' => $targetDate,
+                'take' => '500',
+            ];
+            if ($idBranch !== null && $idBranch > 0) {
+                $query['idBranch'] = (string) $idBranch;
+            }
+
+            try {
+                $response = $this->request('GET', '/api/v1/activities/schedule', $query);
+                $dailyRows = [];
+                $this->collectScheduleRows($response, $dailyRows);
+                foreach ($dailyRows as $row) {
+                    $rows[] = $row;
+                }
+            } catch (RuntimeException $e) {
+                $msg = strtolower($e->getMessage());
+                // Se limite da EVO estourar, devolve o que conseguiu coletar ate aqui.
+                if (str_contains($msg, 'evo http 429')) {
+                    if ($rows !== []) {
+                        break;
+                    }
+                    throw $e;
+                }
+                throw $e;
+            }
+        }
+
+        return $this->buildOperationalInfoFromRows($rows, $from, $to);
+    }
+
+    /**
+     * Busca metadados da unidade diretamente na EVO (endereco/contatos/infraestrutura),
+     * tentando multiplos endpoints e formatos de query.
+     *
+     * @return array<string,mixed>
+     */
+    public function getUnitMetadata(?int $idBranch = null): array
+    {
+        $errors = [];
+        foreach ($this->unitInfoEndpoints() as $endpoint) {
+            foreach ($this->unitInfoQueryCandidates($idBranch) as $query) {
+                try {
+                    $payload = $this->request('GET', $endpoint, $query);
+                    $parsed = $this->parseUnitMetadataPayload($payload, $idBranch);
+                    if ($parsed['has_data'] ?? false) {
+                        $parsed['source_endpoint'] = $endpoint;
+                        $parsed['source_query'] = $query;
+                        return $parsed;
+                    }
+                } catch (RuntimeException $e) {
+                    $queryText = $query !== [] ? ('?' . http_build_query($query)) : '';
+                    $errors[] = $endpoint . $queryText . ': ' . $e->getMessage();
+                }
+            }
+        }
+
+        return [
+            'has_data' => false,
+            'address' => null,
+            'contacts' => null,
+            'infrastructure' => [],
+            'has_parking' => null,
+            'source_endpoint' => null,
+            'source_query' => null,
+            'errors' => array_slice($errors, 0, 5),
+        ];
+    }
+
+    /**
+     * @return array<int,array<string,mixed>>
+     */
+    private function fetchScheduleRowsWithoutDate(?int $idBranch = null): array
+    {
+        $query = [
+            'onlyAvailables' => 'true',
+            'take' => '1000',
+        ];
+        if ($idBranch !== null && $idBranch > 0) {
+            $query['idBranch'] = (string) $idBranch;
+        }
+
+        try {
+            $response = $this->request('GET', '/api/v1/activities/schedule', $query);
+        } catch (RuntimeException) {
+            return [];
+        }
+
+        $rows = [];
+        $this->collectScheduleRows($response, $rows);
+
+        return $rows;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function unitInfoEndpoints(): array
+    {
+        $raw = trim($this->env('EVO_UNIT_INFO_ENDPOINTS', '/api/v1/branches,/api/v1/branch'));
+        $parts = array_filter(array_map('trim', explode(',', $raw)), static fn (string $value): bool => $value !== '');
+
+        $normalized = [];
+        foreach ($parts as $part) {
+            $normalized[] = '/' . ltrim($part, '/');
+        }
+
+        return $normalized !== [] ? array_values(array_unique($normalized)) : ['/api/v1/branches', '/api/v1/branch'];
+    }
+
+    /**
+     * @return array<int,array<string,string>>
+     */
+    private function unitInfoQueryCandidates(?int $idBranch): array
+    {
+        if ($idBranch === null || $idBranch <= 0) {
+            return [[], ['take' => '100', 'skip' => '0']];
+        }
+
+        return [
+            ['idBranch' => (string) $idBranch],
+            ['branchId' => (string) $idBranch],
+            [],
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $payload
+     * @return array<string,mixed>
+     */
+    private function parseUnitMetadataPayload(array $payload, ?int $idBranch): array
+    {
+        $nodes = [];
+        $this->collectAssociativeNodes($payload, $nodes);
+
+        $best = null;
+        $bestScore = -1;
+        foreach ($nodes as $node) {
+            $score = $this->scoreUnitMetadataNode($node, $idBranch);
+            if ($score > $bestScore) {
+                $bestScore = $score;
+                $best = $node;
+            }
+        }
+
+        if (!is_array($best) || $bestScore < 3) {
+            return [
+                'has_data' => false,
+                'address' => null,
+                'contacts' => null,
+                'infrastructure' => [],
+                'has_parking' => null,
+            ];
+        }
+
+        $address = $this->extractAddressFromNode($best);
+        $contacts = $this->extractContactsFromNode($best);
+        $infrastructure = $this->extractInfrastructureFromNode($best);
+        $hasParking = $this->extractHasParkingFromNode($best, $infrastructure);
+
+        return [
+            'has_data' => ($address !== null) || ($contacts !== null) || ($infrastructure !== []) || ($hasParking !== null),
+            'address' => $address,
+            'contacts' => $contacts,
+            'infrastructure' => $infrastructure,
+            'has_parking' => $hasParking,
+        ];
+    }
+
+    /**
+     * @param mixed $node
+     * @param array<int,array<string,mixed>> $nodes
+     */
+    private function collectAssociativeNodes(mixed $node, array &$nodes): void
+    {
+        if (!is_array($node)) {
+            return;
+        }
+        if ($this->isAssociativeArray($node)) {
+            $nodes[] = $node;
+        }
+        foreach ($node as $value) {
+            $this->collectAssociativeNodes($value, $nodes);
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     */
+    private function scoreUnitMetadataNode(array $node, ?int $idBranch): int
+    {
+        $score = 0;
+
+        $idCandidates = ['idBranch', 'branchId', 'idFilial', 'unitId', 'idUnit', 'id'];
+        foreach ($idCandidates as $key) {
+            if (!isset($node[$key])) {
+                continue;
+            }
+            $score += 2;
+            if ($idBranch !== null && $idBranch > 0 && (string) $node[$key] === (string) $idBranch) {
+                $score += 10;
+            }
+        }
+
+        foreach (['address', 'logradouro', 'street', 'district', 'bairro', 'city', 'cidade', 'state', 'uf', 'zip', 'cep'] as $key) {
+            if (isset($node[$key]) && trim((string) $node[$key]) !== '') {
+                $score += 3;
+            }
+        }
+        foreach (['phone', 'telefone', 'cellphone', 'whatsapp', 'email'] as $key) {
+            if (isset($node[$key]) && trim((string) $node[$key]) !== '') {
+                $score += 2;
+            }
+        }
+        foreach (['infrastructure', 'facilities', 'features', 'differentials'] as $key) {
+            if (isset($node[$key])) {
+                $score += 2;
+            }
+        }
+
+        return $score;
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     * @return array<string,mixed>|null
+     */
+    private function extractAddressFromNode(array $node): ?array
+    {
+        $street = $this->readFirstString($node, ['street', 'logradouro', 'address', 'endereco']);
+        $number = $this->readFirstString($node, ['number', 'numero']);
+        $complement = $this->readFirstString($node, ['complement', 'complemento']);
+        $district = $this->readFirstString($node, ['district', 'bairro', 'neighborhood']);
+        $city = $this->readFirstString($node, ['city', 'cidade']);
+        $state = $this->readFirstString($node, ['state', 'uf']);
+        $zip = $this->readFirstString($node, ['zip', 'zipCode', 'cep', 'postalCode']);
+        $formatted = $this->readFirstString($node, ['formattedAddress', 'fullAddress', 'addressComplete']);
+
+        if ($street === null && $district === null && $city === null && $formatted === null) {
+            return null;
+        }
+
+        return [
+            'street' => $street,
+            'number' => $number,
+            'complement' => $complement,
+            'district' => $district,
+            'city' => $city,
+            'state' => $state,
+            'zip_code' => $zip,
+            'formatted' => $formatted,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     * @return array<string,mixed>|null
+     */
+    private function extractContactsFromNode(array $node): ?array
+    {
+        $phone = $this->readFirstString($node, ['phone', 'telefone', 'tel']);
+        $whatsapp = $this->readFirstString($node, ['whatsapp', 'whatsApp', 'phoneWhatsapp', 'telefoneWhatsapp']);
+        $email = $this->readFirstString($node, ['email', 'mail']);
+
+        if ($phone === null && $whatsapp === null && $email === null) {
+            return null;
+        }
+
+        return [
+            'phone' => $phone,
+            'whatsapp' => $whatsapp,
+            'email' => $email,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     * @return string[]
+     */
+    private function extractInfrastructureFromNode(array $node): array
+    {
+        $values = [];
+        foreach (['infrastructure', 'facilities', 'features', 'differentials', 'benefits'] as $key) {
+            if (!isset($node[$key])) {
+                continue;
+            }
+            $raw = $node[$key];
+            if (is_string($raw)) {
+                foreach (preg_split('/[,;\n\r]+/', $raw) ?: [] as $part) {
+                    $text = trim((string) $part);
+                    if ($text !== '') {
+                        $values[] = $text;
+                    }
+                }
+                continue;
+            }
+            if (is_array($raw)) {
+                foreach ($raw as $item) {
+                    if (is_string($item)) {
+                        $text = trim($item);
+                        if ($text !== '') {
+                            $values[] = $text;
+                        }
+                    } elseif (is_array($item)) {
+                        foreach (['name', 'description', 'title', 'text'] as $innerKey) {
+                            if (!isset($item[$innerKey])) {
+                                continue;
+                            }
+                            $text = trim((string) $item[$innerKey]);
+                            if ($text !== '') {
+                                $values[] = $text;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $values = array_values(array_unique(array_filter(array_map('trim', $values), static fn (string $v): bool => $v !== '')));
+        sort($values, SORT_NATURAL | SORT_FLAG_CASE);
+
+        return $values;
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     * @param string[] $infrastructure
+     */
+    private function extractHasParkingFromNode(array $node, array $infrastructure): ?bool
+    {
+        foreach (['hasParking', 'parking', 'estacionamento'] as $key) {
+            if (!array_key_exists($key, $node)) {
+                continue;
+            }
+            $parsed = $this->normalizeBoolLike($node[$key]);
+            if ($parsed !== null) {
+                return $parsed;
+            }
+        }
+
+        foreach ($infrastructure as $item) {
+            $up = strtoupper($item);
+            if (str_contains($up, 'ESTACIONAMENTO') || str_contains($up, 'PARKING')) {
+                return true;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string,mixed> $node
+     * @param string[] $keys
+     */
+    private function readFirstString(array $node, array $keys): ?string
+    {
+        foreach ($keys as $key) {
+            if (!isset($node[$key])) {
+                continue;
+            }
+            $value = trim((string) $node[$key]);
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $rows
+     * @return array<string,mixed>
+     */
+    private function buildOperationalInfoFromRows(array $rows, ?string $forcedFrom, ?string $forcedTo): array
+    {
+        $classes = [];
+        $teachers = [];
+        $slotsByDate = [];
+
+        foreach ($rows as $row) {
+            $dateOnly = $this->extractRowDate($row);
+            if ($dateOnly === null) {
+                continue;
+            }
+
+            $slotsByDate[$dateOnly] = $slotsByDate[$dateOnly] ?? [];
+
+            $time = $this->extractRowTime($row);
+            if ($time !== null) {
+                $slotsByDate[$dateOnly][] = $time;
+            }
+
+            $className = $this->extractRowClassName($row);
+            if ($className !== null) {
+                $classes[] = $className;
+            }
+
+            $teacherName = $this->extractRowTeacherName($row);
+            if ($teacherName !== null) {
+                $teachers[] = $teacherName;
+            }
+        }
+
+        ksort($slotsByDate, SORT_STRING);
+        $scheduleByDate = [];
+        foreach ($slotsByDate as $date => $slots) {
+            sort($slots, SORT_STRING);
+            $uniqueSlots = array_values(array_unique($slots));
+            $scheduleByDate[] = [
+                'date' => $date,
+                'weekday' => $this->weekdayName($date),
+                'first_time' => $uniqueSlots[0] ?? null,
+                'last_time' => $uniqueSlots !== [] ? $uniqueSlots[count($uniqueSlots) - 1] : null,
+                'time_slots' => $uniqueSlots,
+            ];
+        }
+
+        $classes = array_values(array_unique(array_filter(array_map('trim', $classes), static fn (string $v): bool => $v !== '')));
+        sort($classes, SORT_NATURAL | SORT_FLAG_CASE);
+
+        $teachers = array_values(array_unique(array_filter(array_map('trim', $teachers), static fn (string $v): bool => $v !== '')));
+        sort($teachers, SORT_NATURAL | SORT_FLAG_CASE);
+
+        $dates = array_map(static fn (array $item): string => (string) ($item['date'] ?? ''), $scheduleByDate);
+        $dates = array_values(array_filter($dates, static fn (string $v): bool => $v !== ''));
+        sort($dates, SORT_STRING);
+        $computedFrom = $dates[0] ?? null;
+        $computedTo = $dates !== [] ? $dates[count($dates) - 1] : null;
+
+        return [
+            'date_from' => $forcedFrom ?? $computedFrom,
+            'date_to' => $forcedTo ?? $computedTo,
+            'days' => $dates,
+            'class_types' => $classes,
+            'teachers' => $teachers,
+            'schedule' => $scheduleByDate,
+        ];
     }
 
     /**
@@ -624,6 +1109,9 @@ private function buildUrl(string $path, array $query): string
         }
         if ($this->apiKey !== '') {
             $headers[] = 'ApiKey: ' . $this->apiKey;
+        }
+        if ($this->proRequestHeaderName !== '' && $this->proRequestHeaderValue !== '') {
+            $headers[] = $this->proRequestHeaderName . ': ' . $this->proRequestHeaderValue;
         }
 
         return $headers;
@@ -962,7 +1450,7 @@ private function buildUrl(string $path, array $query): string
 
     /**
      * @param array<string,mixed> $payload
-     * @return array<int,array{id:string,name:string,value:float,currency:string}>
+     * @return array<int,array<string,mixed>>
      */
     private function parsePlanOptions(array $payload): array
     {
@@ -990,22 +1478,157 @@ private function buildUrl(string $path, array $query): string
 
             $regularValue = (float) ($row['value'] ?? $row['price'] ?? $row['amount'] ?? 0);
             $promotionalValue = (float) ($row['valuePromotionalPeriod'] ?? $row['promotionalValue'] ?? $row['valuePromotion'] ?? 0);
+            $isPromotional = $promotionalValue > 0;
             $effectiveValue = $promotionalValue > 0 ? $promotionalValue : $regularValue;
             $status = isset($row['status']) ? trim((string) $row['status']) : null;
+
+            $effectiveRounded = round($effectiveValue, 2);
+            $regularRounded = round($regularValue, 2);
+            $promotionalRounded = round($promotionalValue, 2);
+
             $plans[] = [
                 'id' => $id,
                 'name' => $name,
-                'value' => round($effectiveValue, 2),
-                'regular_value' => round($regularValue, 2),
-                'promotional_value' => round($promotionalValue, 2),
+                'value' => $effectiveRounded,
+                'regular_value' => $regularRounded,
+                'promotional_value' => $promotionalRounded,
                 'currency' => strtoupper(trim((string) ($row['currency'] ?? 'BRL'))),
                 'is_active' => $this->extractPlanActiveFlag($row),
                 'is_online' => $this->extractPlanOnlineFlag($row),
                 'status' => $status !== '' ? $status : null,
+                // Campos novos para compatibilidade com fluxo Blip/n8n de promocoes.
+                'is_promotional' => $isPromotional,
+                'value_label' => $this->formatMoneyLabel($effectiveRounded),
+                'regular_value_label' => $this->formatMoneyLabel($regularRounded),
+                'promotional_value_label' => $promotionalRounded > 0
+                    ? $this->formatMoneyLabel($promotionalRounded)
+                    : null,
+                'promo_message' => $isPromotional
+                    ? $this->buildPromotionalMessage($promotionalRounded, $regularRounded)
+                    : null,
+                'promo' => [
+                    'is_promo' => $isPromotional,
+                    'first_period_value' => $promotionalRounded > 0 ? $promotionalRounded : null,
+                    'regular_value_after_period' => $regularRounded > 0 ? $regularRounded : null,
+                    'period_label' => $isPromotional ? '1o mes' : null,
+                    'message' => $isPromotional
+                        ? $this->buildPromotionalMessage($promotionalRounded, $regularRounded)
+                        : null,
+                ],
+                'months_promotional_period' => (int) ($row['monthsPromotionalPeriod'] ?? 0),
+                'days_promotional_period' => (int) ($row['daysPromotionalPeriod'] ?? 0),
+                'online_sales_observations' => $this->extractOnlineSalesObservation($row),
+                'differentials' => $this->extractDifferentials($row),
+                'benefits' => $this->extractPlanBenefits($row),
+                'url_sale' => isset($row['urlSale']) ? trim((string) $row['urlSale']) : null,
+                'external_sale_available' => $this->normalizeBoolLike($row['externalSaleAvailable'] ?? null),
             ];
         }
 
         return $plans;
+    }
+
+    private function formatMoneyLabel(float $amount): string
+    {
+        return 'R$ ' . number_format($amount, 2, '.', '');
+    }
+
+    private function buildPromotionalMessage(float $promoValue, float $regularValue): string
+    {
+        return sprintf(
+            'Promocao: R$ %.2f no 1o mes. Apos esse periodo, a mensalidade sera de R$ %.2f.',
+            $promoValue,
+            $regularValue
+        );
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     * @return string[]
+     */
+    private function extractDifferentials(array $row): array
+    {
+        $raw = $row['differentials'] ?? [];
+        if (!is_array($raw)) {
+            return [];
+        }
+
+        $items = [];
+        foreach ($raw as $entry) {
+            if (is_string($entry)) {
+                $text = trim($entry);
+                if ($text !== '') {
+                    $items[] = $text;
+                }
+                continue;
+            }
+            if (!is_array($entry)) {
+                continue;
+            }
+
+            foreach (['description', 'name', 'title', 'differential', 'text'] as $key) {
+                if (!isset($entry[$key])) {
+                    continue;
+                }
+                $text = trim((string) $entry[$key]);
+                if ($text !== '') {
+                    $items[] = $text;
+                    break;
+                }
+            }
+        }
+
+        return array_values(array_unique($items));
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function extractOnlineSalesObservation(array $row): ?string
+    {
+        foreach (['onlineSalesObservations', 'onlineSalesObservation', 'salesObservation', 'observation'] as $key) {
+            if (!isset($row[$key])) {
+                continue;
+            }
+            $text = trim((string) $row[$key]);
+            if ($text !== '') {
+                return $text;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     * @return string[]
+     */
+    private function extractPlanBenefits(array $row): array
+    {
+        $benefits = $this->extractDifferentials($row);
+        $observation = $this->extractOnlineSalesObservation($row);
+        if ($observation === null || $observation === '') {
+            return $benefits;
+        }
+
+        $normalized = str_replace(["\r\n", "\r"], "\n", $observation);
+        $lines = explode("\n", $normalized);
+        foreach ($lines as $line) {
+            $clean = trim($line);
+            $clean = trim($clean, " \t\n\r\0\x0B-•");
+            if ($clean === '') {
+                continue;
+            }
+
+            // Evita duplicar linhas de promocao e valores no bloco de beneficios
+            if (stripos($clean, 'promoc') !== false || stripos($clean, 'mensalidade') !== false) {
+                continue;
+            }
+
+            $benefits[] = $clean;
+        }
+
+        return array_values(array_unique($benefits));
     }
 
     /**
@@ -1085,7 +1708,7 @@ private function buildUrl(string $path, array $query): string
         if ($endpointPath === '/api/v2/membership') {
             $query = [
                 'showAccessBranches' => 'false',
-                'showOnlineSalesObservation' => 'false',
+                'showOnlineSalesObservation' => 'true',
             ];
             if ($idBranch !== null && $idBranch > 0) {
                 $query['idBranch'] = (string) $idBranch;
@@ -1361,6 +1984,183 @@ private function buildUrl(string $path, array $query): string
         }
     }
 
+    /**
+     * @param mixed $node
+     * @param array<int,array<string,mixed>> $rows
+     */
+    private function collectScheduleRows(mixed $node, array &$rows): void
+    {
+        if (!is_array($node)) {
+            return;
+        }
+
+        if ($this->isAssociativeArray($node) && $this->looksLikeScheduleRow($node)) {
+            $rows[] = $node;
+        }
+
+        foreach ($node as $value) {
+            $this->collectScheduleRows($value, $rows);
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function looksLikeScheduleRow(array $row): bool
+    {
+        $candidates = ['activityDate', 'startDate', 'date', 'dtActivity', 'startTime', 'time', 'hour'];
+        foreach ($candidates as $key) {
+            if (array_key_exists($key, $row)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function extractRowDate(array $row): ?string
+    {
+        $candidates = [
+            $row['activityDate'] ?? null,
+            $row['startDate'] ?? null,
+            $row['date'] ?? null,
+            $row['dtActivity'] ?? null,
+            $row['dateTime'] ?? null,
+            $row['initialDate'] ?? null,
+        ];
+        foreach ($candidates as $candidate) {
+            if (!is_scalar($candidate)) {
+                continue;
+            }
+            $value = $this->normalizeDateOnlyCandidate((string) $candidate);
+            if ($value !== null) {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function extractRowTime(array $row): ?string
+    {
+        $timeCandidates = [
+            $row['startTime'] ?? null,
+            $row['time'] ?? null,
+            $row['hour'] ?? null,
+            $row['startHour'] ?? null,
+            $row['hourStart'] ?? null,
+        ];
+        foreach ($timeCandidates as $candidate) {
+            if (!is_scalar($candidate)) {
+                continue;
+            }
+            $time = $this->normalizeHourMinuteCandidate((string) $candidate);
+            if ($time !== null) {
+                return $time;
+            }
+        }
+
+        $dateTimeCandidates = [
+            $row['startDate'] ?? null,
+            $row['dateTime'] ?? null,
+            $row['initialDate'] ?? null,
+            $row['dtActivity'] ?? null,
+        ];
+        foreach ($dateTimeCandidates as $candidate) {
+            if (!is_scalar($candidate)) {
+                continue;
+            }
+            $normalized = $this->normalizeDateTimeCandidate((string) $candidate);
+            if ($normalized !== null) {
+                return $normalized['time'];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function extractRowClassName(array $row): ?string
+    {
+        $candidates = [
+            'activity',
+            'activityName',
+            'service',
+            'serviceName',
+            'className',
+            'name',
+            'description',
+            'modalidade',
+            'modality',
+        ];
+        foreach ($candidates as $key) {
+            if (!isset($row[$key])) {
+                continue;
+            }
+            $value = trim((string) $row[$key]);
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array<string,mixed> $row
+     */
+    private function extractRowTeacherName(array $row): ?string
+    {
+        $candidates = [
+            'teacher',
+            'teacherName',
+            'nameTeacher',
+            'professor',
+            'instructor',
+            'employeeName',
+            'staffName',
+        ];
+        foreach ($candidates as $key) {
+            if (!isset($row[$key])) {
+                continue;
+            }
+            $value = trim((string) $row[$key]);
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        return null;
+    }
+
+    private function weekdayName(string $date): string
+    {
+        $ts = strtotime($date);
+        if ($ts === false) {
+            return '';
+        }
+        $map = [
+            'Sunday' => 'domingo',
+            'Monday' => 'segunda',
+            'Tuesday' => 'terca',
+            'Wednesday' => 'quarta',
+            'Thursday' => 'quinta',
+            'Friday' => 'sexta',
+            'Saturday' => 'sabado',
+        ];
+        $en = date('l', $ts);
+
+        return $map[$en] ?? strtolower($en);
+    }
+
     private function normalizeDateOnlyCandidate(string $raw): ?string
     {
         $value = trim($raw);
@@ -1508,6 +2308,19 @@ private function buildUrl(string $path, array $query): string
         $value = filter_var($raw, FILTER_VALIDATE_INT);
         if ($value === false || $value < 0) {
             return $default;
+        }
+
+        return $value;
+    }
+
+    private function normalizeHeaderName(string $name): string
+    {
+        $value = trim($name);
+        if ($value === '') {
+            return '';
+        }
+        if (preg_match('/^[A-Za-z0-9-]+$/', $value) !== 1) {
+            return '';
         }
 
         return $value;

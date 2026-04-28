@@ -53,7 +53,10 @@ final class N8nPlanSaleController extends N8nFlowController
 
             $normalized['plan_id'] = (int) ($onlinePlan['id'] ?? 0);
             $normalized['plan_name'] = (string) ($onlinePlan['name'] ?? $normalized['plan_name']);
-            $normalized['plan_value'] = round((float) ($onlinePlan['value'] ?? $normalized['plan_value']), 2);
+            $normalized['plan_value'] = round($this->parseMoneyValue($onlinePlan['value'] ?? $normalized['plan_value']), 2);
+            if ($normalized['plan_value'] <= 0) {
+                throw new RuntimeException('plan_value deve ser maior que zero.');
+            }
 
             // Fluxo equivalente ao Blip para venda online: prospect + payment=6 + idProspect.
             $prospectResponse = $evoService->createProspect([
@@ -130,7 +133,7 @@ final class N8nPlanSaleController extends N8nFlowController
         $email = trim((string) ($payload['email'] ?? ''));
         $planId = trim((string) ($payload['plan_id'] ?? ''));
         $planName = trim((string) ($payload['plan_name'] ?? ''));
-        $planValue = (float) ($payload['plan_value'] ?? 0);
+        $planValue = $this->parseMoneyValue($payload['plan_value'] ?? null);
 
         if (strlen($cpf) !== 11) {
             throw new RuntimeException('CPF invalido (11 digitos).');
@@ -141,10 +144,6 @@ final class N8nPlanSaleController extends N8nFlowController
         if ($planName === '' && $planId === '') {
             throw new RuntimeException('Informe plan_id ou plan_name.');
         }
-        if ($planValue <= 0) {
-            throw new RuntimeException('plan_value deve ser maior que zero.');
-        }
-
         $normalized = [
             'cpf' => $cpf,
             'customer_name' => $customerName,
@@ -165,6 +164,44 @@ final class N8nPlanSaleController extends N8nFlowController
         }
 
         return $normalized;
+    }
+
+    private function parseMoneyValue(mixed $raw): float
+    {
+        if (is_int($raw) || is_float($raw)) {
+            return (float) $raw;
+        }
+
+        if (!is_string($raw)) {
+            return 0.0;
+        }
+
+        $value = trim($raw);
+        if ($value === '') {
+            return 0.0;
+        }
+
+        $value = preg_replace('/[^\d,.\-]/', '', $value) ?? '';
+        if ($value === '' || $value === '-' || $value === ',' || $value === '.') {
+            return 0.0;
+        }
+
+        $lastComma = strrpos($value, ',');
+        $lastDot = strrpos($value, '.');
+
+        if ($lastComma !== false && $lastDot !== false) {
+            if ($lastComma > $lastDot) {
+                $value = str_replace('.', '', $value);
+                $value = str_replace(',', '.', $value);
+            } else {
+                $value = str_replace(',', '', $value);
+            }
+        } elseif ($lastComma !== false) {
+            $value = str_replace('.', '', $value);
+            $value = str_replace(',', '.', $value);
+        }
+
+        return (float) $value;
     }
 
     /**

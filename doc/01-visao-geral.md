@@ -36,3 +36,5 @@ Centralizar operacao de inadimplencia, vendas de planos e aulas experimentais po
 - `doc/14-testes-finais-etapa-a-etapa.md`
 - `doc/15-seguranca-e-validacao-webhook-evo.md`
 - `doc/16-deploy-producao-checklist.md`
+- `doc/05-testes-etapa-a-etapa.md`
+- `doc/17-saas-multi-tenant-e-permissoes.md`
